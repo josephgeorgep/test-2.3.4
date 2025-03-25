@@ -1,83 +1,80 @@
-#include <esp_now.h>
 #include <WiFi.h>
-#include <HardwareSerial.h>
+#include <esp_now.h>
 
-// Define UART for communication with the MQTT ESP32-C3
-#define UART_RX 6  // Connect to TX of MQTT ESP32-C3
-#define UART_TX 7  // Connect to RX of MQTT ESP32-C3
+// UART Pins (Communication with MQTT Gateway)
+#define UART_RX 4  // Connect to TX of MQTT Gateway (Third ESP32-C3)
+#define UART_TX 5  // Connect to RX of MQTT Gateway (Third ESP32-C3)
 
-HardwareSerial mqttSerial(1);
+// Replace with the MAC address of the First ESP32-C3 (Relay Controller)
+uint8_t RELAY_CONTROLLER_MAC[] = {0x34, 0x85, 0x18, 0x17, 0x6B, 0x50};
 
-// Placeholder for Relay Controller MAC Address (Replace this with actual MAC)
-uint8_t relayControllerMAC[] = {0x34, 0x85, 0x18, 0x17, 0x6B, 0x50};
-
-// Structure for ESP-NOW commands
+// Structure for relaying messages via ESP-NOW
 typedef struct {
   uint8_t relayNumber;
   uint8_t state;
 } RelayCommand;
 
-// ESP-NOW Data Receive Callback
-void OnDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
-  if (len == sizeof(RelayCommand)) {
-    RelayCommand command;
-    memcpy(&command, incomingData, sizeof(command));
+// ESPNOW Peer
+esp_now_peer_info_t peerInfo;
 
-    // Send received ESP-NOW data to MQTT ESP32-C3 over Serial
-    mqttSerial.printf("Relay:%d State:%d\n", command.relayNumber, command.state);
-    Serial.printf("Received from ESP-NOW: Relay %d -> %s\n", command.relayNumber, command.state ? "ON" : "OFF");
+// Function to send relay command via ESP-NOW
+void sendESPNowCommand(uint8_t relayNumber, uint8_t state) {
+  RelayCommand command;
+  command.relayNumber = relayNumber;
+  command.state = state;
+  esp_err_t result = esp_now_send(RELAY_CONTROLLER_MAC, (uint8_t *)&command, sizeof(command));
+  
+  if (result == ESP_OK) {
+    Serial.println("[ESP-NOW] Command sent successfully");
+  } else {
+    Serial.println("[ESP-NOW] Failed to send command");
   }
 }
 
-// Function to send ESP-NOW command to the relay controller
-void sendEspNowCommand(uint8_t relayNumber, uint8_t state) {
-  RelayCommand command = {relayNumber, state};
+// Callback for received ESP-NOW messages (Relay state updates)
+void OnDataRecv(const esp_now_recv_info *info, const uint8_t *incomingData, int len) {
+  RelayCommand command;
+  memcpy(&command, incomingData, sizeof(command));
 
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, relayControllerMAC, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
+  Serial.printf("[ESP-NOW] Received Update -> Relay %d: %s\n", command.relayNumber, command.state ? "ON" : "OFF");
 
-  if (!esp_now_is_peer_exist(relayControllerMAC)) {
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-      Serial.println("Failed to add ESP-NOW peer!");
-      return;
-    }
-  }
-
-  esp_err_t result = esp_now_send(relayControllerMAC, (uint8_t *)&command, sizeof(command));
-
-  if (result == ESP_OK) {
-    Serial.printf("Sent to Relay Controller: Relay %d -> %s\n", relayNumber, state ? "ON" : "OFF");
-  } else {
-    Serial.println("Error sending ESP-NOW command");
-  }
+  // Forward the received relay status to MQTT Gateway via UART
+  Serial1.printf("relay_status %d %d\n", command.relayNumber, command.state);
 }
 
 void setup() {
   Serial.begin(115200);
-  mqttSerial.begin(115200, SERIAL_8N1, UART_RX, UART_TX);
+  Serial1.begin(115200, SERIAL_8N1, UART_RX, UART_TX); // Use Serial1 for UART
 
   WiFi.mode(WIFI_STA);
+
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
+    Serial.println("[ESP-NOW] Error initializing ESP-NOW");
     return;
   }
-  
+
   esp_now_register_recv_cb(OnDataRecv);
 
-  Serial.println("ESP-NOW Gateway Ready!");
+  // Add Relay Controller as a peer
+  memcpy(peerInfo.peer_addr, RELAY_CONTROLLER_MAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("[ESP-NOW] Failed to add peer");
+    return;
+  }
+  Serial.println("[ESP-NOW] Gateway Ready!");
 }
 
 void loop() {
-  // Read from MQTT ESP32-C3 over Serial
-  if (mqttSerial.available()) {
-    String msg = mqttSerial.readStringUntil('\n');
-
-    // Parse message format: "Relay:1 State:1"
-    int relayNum, state;
-    if (sscanf(msg.c_str(), "Relay:%d State:%d", &relayNum, &state) == 2) {
-      sendEspNowCommand(relayNum, state);
+  // Listen for MQTT commands via UART
+  if (Serial1.available()) {
+    String command = Serial1.readStringUntil('\n');
+    int relayNumber, state;
+    if (sscanf(command.c_str(), "%d %d", &relayNumber, &state) == 2) {
+      Serial.printf("[UART] Received MQTT Command -> Relay %d: %s\n", relayNumber, state ? "ON" : "OFF");
+      sendESPNowCommand(relayNumber, state);
     }
   }
 }
